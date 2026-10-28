@@ -1,37 +1,66 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { StatusBar } from 'expo-status-bar';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
   Pressable,
   ScrollView,
-  StyleSheet,
   Text,
   TextInput,
   View,
 } from 'react-native';
+import { Practice } from './src/Practice';
 import { findLearner } from './src/data/learners';
 import { Conversation, PROFILES } from './src/data/profiles';
+import { styles } from './src/styles';
 
-type Learner = { name: string; profileId: string };
+const EMAIL_KEY = 'thrivlingo.email';
+
+type Learner = { name: string; profileId: string; email: string };
 
 export default function App() {
+  const [ready, setReady] = useState(false);
   const [learner, setLearner] = useState<Learner | null>(null);
   const [open, setOpen] = useState<Conversation | null>(null);
 
-  let screen;
-  if (!learner) {
-    screen = <SignIn onSignIn={setLearner} />;
+  // Remember who signed in, so they go straight to their conversations next time.
+  useEffect(() => {
+    (async () => {
+      try {
+        const saved = await AsyncStorage.getItem(EMAIL_KEY);
+        const found = saved ? findLearner(saved) : null;
+        if (saved && found) setLearner({ ...found, email: saved });
+      } finally {
+        setReady(true);
+      }
+    })();
+  }, []);
+
+  const signIn = async (email: string) => {
+    const found = findLearner(email);
+    if (!found) return false;
+    const clean = email.trim().toLowerCase();
+    await AsyncStorage.setItem(EMAIL_KEY, clean).catch(() => {});
+    setLearner({ ...found, email: clean });
+    return true;
+  };
+
+  const signOut = async () => {
+    await AsyncStorage.removeItem(EMAIL_KEY).catch(() => {});
+    setOpen(null);
+    setLearner(null);
+  };
+
+  let screen = null;
+  if (!ready) {
+    screen = null;
+  } else if (!learner) {
+    screen = <SignIn onSignIn={signIn} />;
   } else if (open) {
-    screen = <ConversationIntro conversation={open} onBack={() => setOpen(null)} />;
+    screen = <Practice email={learner.email} conversation={open} onBack={() => setOpen(null)} />;
   } else {
-    screen = (
-      <Home
-        learner={learner}
-        onOpen={setOpen}
-        onSignOut={() => setLearner(null)}
-      />
-    );
+    screen = <Home learner={learner} onOpen={setOpen} onSignOut={signOut} />;
   }
 
   return (
@@ -42,18 +71,13 @@ export default function App() {
   );
 }
 
-function SignIn({ onSignIn }: { onSignIn: (l: Learner) => void }) {
+function SignIn({ onSignIn }: { onSignIn: (email: string) => Promise<boolean> }) {
   const [email, setEmail] = useState('');
   const [error, setError] = useState('');
 
-  const submit = () => {
-    const found = findLearner(email);
-    if (found) {
-      setError('');
-      onSignIn(found);
-    } else {
-      setError("We couldn't find that email. Check it, or ask Rodrigo to add you.");
-    }
+  const submit = async () => {
+    const ok = await onSignIn(email);
+    setError(ok ? '' : "We couldn't find that email. Check it, or ask Rodrigo to add you.");
   };
 
   return (
@@ -109,85 +133,3 @@ function Home({
     </ScrollView>
   );
 }
-
-function ConversationIntro({
-  conversation,
-  onBack,
-}: {
-  conversation: Conversation;
-  onBack: () => void;
-}) {
-  return (
-    <ScrollView contentContainerStyle={styles.page}>
-      <Pressable onPress={onBack}>
-        <Text style={styles.link}>‹ Back</Text>
-      </Pressable>
-      <Text style={styles.hello}>{conversation.title}</Text>
-      <Text style={styles.label}>Where you are</Text>
-      <Text style={styles.body}>{conversation.situation}</Text>
-      <Text style={styles.label}>Who you talk to</Text>
-      <Text style={styles.body}>
-        {conversation.character.name}, {conversation.character.role}
-      </Text>
-      <Text style={styles.label}>Your goal</Text>
-      <Text style={styles.body}>{conversation.goal}</Text>
-      <View style={styles.bubble}>
-        <Text style={styles.bubbleName}>{conversation.character.name}</Text>
-        <Text style={styles.bubbleText}>{conversation.opener}</Text>
-      </View>
-      <Text style={styles.note}>Voice conversation coming in the next version.</Text>
-    </ScrollView>
-  );
-}
-
-const ink = '#1d2433';
-const accent = '#1f7a5c';
-
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: '#faf8f4' },
-  center: { flex: 1, justifyContent: 'center', padding: 24 },
-  page: { padding: 24, paddingTop: 72, gap: 12 },
-  brand: { fontSize: 36, fontWeight: '700', color: accent, marginBottom: 4 },
-  tagline: { fontSize: 16, color: ink, marginBottom: 24 },
-  input: {
-    borderWidth: 1,
-    borderColor: '#d9d4ca',
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    padding: 14,
-    fontSize: 16,
-    color: ink,
-  },
-  error: { color: '#b3261e', marginTop: 8 },
-  button: {
-    backgroundColor: accent,
-    borderRadius: 12,
-    padding: 14,
-    alignItems: 'center',
-    marginTop: 16,
-  },
-  buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
-  hello: { fontSize: 28, fontWeight: '700', color: ink },
-  subtitle: { fontSize: 16, color: ink, marginBottom: 8 },
-  card: {
-    backgroundColor: '#fff',
-    borderRadius: 14,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: '#ece7dd',
-  },
-  cardTitle: { fontSize: 17, fontWeight: '600', color: ink },
-  cardText: { fontSize: 14, color: '#5b6272', marginTop: 4 },
-  link: { color: accent, fontSize: 16, paddingVertical: 8 },
-  label: { fontSize: 13, fontWeight: '600', color: '#5b6272', marginTop: 8 },
-  body: { fontSize: 16, color: ink },
-  bubble: {
-    backgroundColor: '#e6f2ed',
-    borderRadius: 16,
-    padding: 16,
-    marginTop: 16,
-  },
-  bubbleName: { fontSize: 13, fontWeight: '600', color: accent, marginBottom: 4 },
-  bubbleText: { fontSize: 18, color: ink },
-  note: { fontSize: 13, color: '#5b6272', marginTop: 8 },
-});

@@ -1,0 +1,13 @@
+{
+  "cli": { "version": ">= 16.0.0", "appVersionSource": "remote" },
+  "build": {
+    "production": {
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://thrivlingo-api.REPLACE-WITH-YOUR-SUBDOMAIN.workers.dev",
+        "EXPO_PUBLIC_APP_TOKEN": "4q3JMg4rWFxgqoCOwUND3vh2rqpR5KvA"
+      }
+    }
+  },
+  "submit": { "production": {} }
+}

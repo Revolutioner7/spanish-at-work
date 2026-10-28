@@ -1,0 +1,11 @@
+name = "thrivlingo-api"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+
+[vars]
+# Who may use the app. Keep in sync with src/data/learners.ts in the app.
+ALLOWED_EMAILS = "scott@thriviti.com,rodrigo@harmat.es"
+
+# Secrets (never written here):
+#   npx wrangler secret put ANTHROPIC_API_KEY
+#   npx wrangler secret put APP_TOKEN

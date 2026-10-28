@@ -8,10 +8,23 @@
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "es.harmat.thrivlingo"
+      "bundleIdentifier": "es.harmat.thrivlingo",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Thrivlingo uses the microphone so you can talk with the characters.",
+          "speechRecognitionPermission": "Thrivlingo turns your voice into text so the characters can understand you."
+        }
+      ]
+    ],
+    "owner": "harmat"
   }
 }
