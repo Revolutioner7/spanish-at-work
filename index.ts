@@ -1,8 +1,62 @@
-import { registerRootComponent } from 'expo';
+import React from "react";
+import { registerRootComponent } from "expo";
+import { ScrollView, Text } from "react-native";
 
-import App from './App';
+// Si algo falla al arrancar o durante el uso, en vez de cerrarse la app
+// muestra el error en pantalla, para poder enviárselo a Claude y arreglarlo.
 
-// registerRootComponent calls AppRegistry.registerComponent('main', () => App);
-// It also ensures that whether you load the app in Expo Go or in a native build,
-// the environment is set up appropriately
-registerRootComponent(App);
+let lastError: string | null = null;
+const listeners = new Set<() => void>();
+function report(error: unknown) {
+  const e = error as any;
+  lastError = `${e?.name ?? "Error"}: ${e?.message ?? String(error)}\n\n${e?.stack ?? ""}`;
+  listeners.forEach((l) => l());
+}
+
+const g = globalThis as any;
+if (g.ErrorUtils?.setGlobalHandler) {
+  g.ErrorUtils.setGlobalHandler((error: unknown) => report(error));
+}
+
+function ErrorScreen({ message }: { message: string }) {
+  return React.createElement(
+    ScrollView,
+    { style: { flex: 1, backgroundColor: "#F7F6F1" }, contentContainerStyle: { padding: 20, paddingTop: 80 } },
+    React.createElement(Text, { style: { fontSize: 22, fontWeight: "700", color: "#A33A3A", marginBottom: 12 } }, "Thrivlingo hit an error"),
+    React.createElement(Text, { style: { fontSize: 14, color: "#2B2420", marginBottom: 16 } }, "Take a screenshot of this screen and send it to Rodrigo."),
+    React.createElement(Text, { selectable: true, style: { fontSize: 12, color: "#2B2420", fontFamily: "Menlo" } }, message)
+  );
+}
+
+let AppComponent: React.ComponentType | null = null;
+try {
+  AppComponent = require("./App").default;
+} catch (e) {
+  report(e);
+}
+
+class Root extends React.Component<{}, { error: string | null }> {
+  state = { error: lastError };
+  private unsub = () => {};
+  componentDidMount() {
+    const l = () => this.setState({ error: lastError });
+    listeners.add(l);
+    this.unsub = () => listeners.delete(l);
+  }
+  componentWillUnmount() {
+    this.unsub();
+  }
+  componentDidCatch(error: unknown) {
+    report(error);
+  }
+  static getDerivedStateFromError(error: unknown) {
+    const e = error as any;
+    return { error: `${e?.name ?? "Error"}: ${e?.message ?? String(error)}\n\n${e?.stack ?? ""}` };
+  }
+  render() {
+    if (this.state.error || !AppComponent) return React.createElement(ErrorScreen, { message: this.state.error ?? "The app could not load." });
+    return React.createElement(AppComponent);
+  }
+}
+
+registerRootComponent(Root);

@@ -1,0 +1,11 @@
+{
+  // Intermediario de Thrivlingo. Las claves se guardan como secretos en Cloudflare,
+  // nunca en este archivo: ANTHROPIC_API_KEY, THRIVLINGO_APP_KEY y GOOGLE_TTS_KEY.
+  "name": "thrivlingo-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "vars": {
+    // Quién puede usar la app. Mantener igual que src/learners.ts.
+    "ALLOWED_EMAILS": "scott@thriviti.com,rodrigo@harmat.es"
+  }
+}

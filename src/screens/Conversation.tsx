@@ -1,0 +1,652 @@
+import React, { useEffect, useRef, useState } from "react";
+import { ActivityIndicator, Alert, Image, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View, type ScrollViewInstance } from "react-native";
+import { speak as ttsSpeak, stopSpeaking } from "../tts";
+import { cleanWord, explainWord, type WordExplanation } from "../words";
+import { analyzeTurn, type TurnAnalysis } from "../turn";
+import {
+  ExpoSpeechRecognitionModule,
+  useSpeechRecognitionEvent,
+  type ExpoSpeechRecognitionResultSegment,
+} from "expo-speech-recognition";
+import { CharacterId, getCharacter } from "../brain/characters";
+import { getTappa } from "../brain/path";
+import { conversationSystemDynamic, conversationSystemStatic, TaskType } from "../brain/prompts";
+import { callClaude, ChatMessage } from "../api";
+import { LEARNER_LANG, MODEL_CONVERSATION, TARGET_LANG, WRAP_UP_MINUTES } from "../config";
+import { getCharacterMemory, getSetting, getUserFacts, startSession } from "../db";
+import { countSyllables, countWords, turnSeconds } from "../fluency";
+import { pickVoice } from "../voice";
+import { colors, gap, radius } from "../theme";
+
+export type ConversationResult = {
+  sessionId: number;
+  characterId: CharacterId;
+  tappaId?: string;
+  messages: ChatMessage[];
+  userSeconds: number;
+  userSyllables: number;
+  userWords: number;
+};
+
+type Props = {
+  characterId: CharacterId;
+  tappaId?: string;
+  onFinish: (result: ConversationResult) => void;
+  onCancel: () => void;
+};
+
+type Phase = "thinking" | "speaking" | "listening" | "waiting" | "typing";
+
+const START_TOKEN = "[The conversation starts now. Greet them and open, picking up something from last time if there was one.]";
+const SILENCE_TO_SEND_MS = 1500; // tiempo sin palabras nuevas tras el que se da tu turno por terminado
+const QUIET_MS = 1000; // y además el micrófono no oye voz desde hace este tiempo
+const VOICE_LEVEL = 1.5; // nivel del micrófono (de -2 a 10) a partir del cual se considera que hablas
+const NO_SPEECH_MS = 15000; // si no dices nada en este tiempo, se deja de escuchar
+const NOTE_SIMPLER =
+  "[App note: the learner needed to look up words or hear your last message more slowly. Speak simpler and shorter: few words per sentence and very frequent vocabulary.]";
+
+export default function Conversation({ characterId, tappaId, onFinish, onCancel }: Props) {
+  const character = getCharacter(characterId);
+  const tappa = getTappa(tappaId);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [phase, setPhase] = useState<Phase>("thinking");
+  const [draft, setDraft] = useState("");
+  const [elapsed, setElapsed] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [lookup, setLookup] = useState<{ word: string; sentence: string; data?: WordExplanation; error?: string } | null>(null);
+  const resumeAfterLookup = useRef(false);
+  const [analyses, setAnalyses] = useState<Record<number, TurnAnalysis>>({});
+  const [helper, setHelper] = useState<{ es: string } | null>(null);
+  const [helperBusy, setHelperBusy] = useState(false);
+
+  const sessionId = useRef(0);
+  const startedAt = useRef(Date.now());
+  const listenStartedAt = useRef(0);
+  const lastResultAt = useRef(0);
+  const lastLoudAt = useRef(0);
+  const transcript = useRef("");
+  const lastSegments = useRef<ExpoSpeechRecognitionResultSegment[] | undefined>(undefined);
+  const stats = useRef({ seconds: 0, syllables: 0, words: 0 });
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const neededHelp = useRef(false);
+  const endAction = useRef<"send" | "ayuda" | "idle">("idle");
+  const listenLang = useRef<"target" | "learner">("target");
+  const recognizing = useRef(false); // solo se procesan los finales de una escucha activa
+
+  function abortRecognition() {
+    recognizing.current = false;
+    ExpoSpeechRecognitionModule.abort();
+  }
+  const silenceTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const voiceId = useRef<string | undefined>(undefined);
+  const alive = useRef(true);
+  const scrollRef = useRef<ScrollViewInstance>(null);
+
+  const task: TaskType = "fluency";
+  const systemStatic = conversationSystemStatic(character);
+  const systemDynamic = conversationSystemDynamic({
+    userFacts: getUserFacts(),
+    characterMemory: getCharacterMemory(characterId),
+    levelListening: getSetting("level_listening", "A1 (estimated)"),
+    levelSpeaking: getSetting("level_speaking", "A1 (estimated)"),
+    task,
+    mission: tappa?.steer,
+  });
+
+  useEffect(() => {
+    alive.current = true;
+    sessionId.current = startSession(characterId);
+    startedAt.current = Date.now();
+    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt.current) / 1000)), 1000);
+
+    (async () => {
+      voiceId.current = await pickVoice(character.voiceGender);
+      const perm = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert("Microphone", "Thrivlingo needs microphone and speech recognition access. Turn them on in your iPhone Settings.");
+      }
+      await characterTurn([]);
+    })();
+
+    return () => {
+      alive.current = false;
+      clearInterval(timer);
+      stopSilenceTimer();
+      stopSpeaking();
+      abortRecognition();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Reconocimiento de voz
+  useSpeechRecognitionEvent("result", (event) => {
+    const result = event.results[0];
+    if (!result) return;
+    if (result.transcript !== transcript.current) lastResultAt.current = Date.now(); // solo cuenta si hay palabras nuevas
+    transcript.current = result.transcript;
+    setDraft(result.transcript);
+    if (result.segments?.length) lastSegments.current = result.segments;
+  });
+
+  useSpeechRecognitionEvent("volumechange", (event) => {
+    if (event.value > VOICE_LEVEL) lastLoudAt.current = Date.now();
+  });
+
+  useSpeechRecognitionEvent("end", () => {
+    if (!recognizing.current) return;
+    recognizing.current = false;
+    stopSilenceTimer();
+    const action = endAction.current;
+    endAction.current = "idle";
+    if (!alive.current) return;
+    if (listenLang.current === "learner") {
+      listenLang.current = "target";
+      const said = transcript.current.trim();
+      if (said) howToSay(said);
+      else setPhase("waiting");
+      return;
+    }
+    if (action === "ayuda") {
+      sendText("ayuda", false);
+      return;
+    }
+    const text = transcript.current.trim();
+    if (action === "send" && text) {
+      const fallback = (lastResultAt.current - listenStartedAt.current) / 1000;
+      stats.current.seconds += turnSeconds(lastSegments.current, fallback);
+      stats.current.syllables += countSyllables(text);
+      stats.current.words += countWords(text);
+      sendText(text, true);
+      return;
+    }
+    setPhase("waiting");
+  });
+
+  useSpeechRecognitionEvent("error", (event) => {
+    if (event.error === "aborted" || event.error === "no-speech" || !recognizing.current) return;
+    recognizing.current = false;
+    stopSilenceTimer();
+    setError(`Speech recognition failed (${event.error}). You can type your answer.`);
+    setPhase("typing");
+  });
+
+  function stopSilenceTimer() {
+    if (silenceTimer.current) clearInterval(silenceTimer.current);
+    silenceTimer.current = null;
+  }
+
+  async function characterTurn(history: ChatMessage[]) {
+    setPhase("thinking");
+    setError(null);
+    try {
+      const apiMessages: ChatMessage[] = [{ role: "user", content: START_TOKEN }, ...history];
+      const reply = await callClaude({ model: MODEL_CONVERSATION, systemStatic, systemDynamic, messages: apiMessages, maxTokens: 250 });
+      if (!alive.current) return;
+      const next = [...history, { role: "assistant" as const, content: reply }];
+      messagesRef.current = next;
+      setMessages(next);
+      speak(reply, 1, true);
+      // En paralelo a la voz: reformulación marcada, palabras nuevas e imágenes
+      const lastUser = history[history.length - 1];
+      if (lastUser?.role === "user") {
+        const said = clean(lastUser.content).trim();
+        if (said && said.toLowerCase() !== "ayuda") {
+          const idx = next.length - 1;
+          analyzeTurn(said, reply)
+            .then((a) => alive.current && setAnalyses((prev) => ({ ...prev, [idx]: a })))
+            .catch(() => {});
+        }
+      }
+    } catch (e: any) {
+      setError(e?.message ?? "Couldn't reach the AI.");
+      setPhase("waiting");
+    }
+  }
+
+  /** Lee en voz alta. Si listenAfter es true, al terminar empieza a escucharte solo. */
+  function speak(text: string, speed = 1, listenAfter = true) {
+    abortRecognition();
+    stopSilenceTimer();
+    setPhase("speaking");
+    ttsSpeak(text, {
+      googleVoice: character.googleVoice,
+      deviceVoice: voiceId.current,
+      rate: character.speechRate * speed,
+      onDone: () => {
+        if (!alive.current) return;
+        if (listenAfter) setTimeout(() => alive.current && startListening(), 80);
+        else setPhase("waiting");
+      },
+    });
+  }
+
+  function startListening(lang: "target" | "learner" = "target") {
+    listenLang.current = lang;
+    stopSpeaking();
+    setDraft("");
+    setError(null);
+    transcript.current = "";
+    lastSegments.current = undefined;
+    listenStartedAt.current = Date.now();
+    lastResultAt.current = 0;
+    lastLoudAt.current = 0;
+    endAction.current = "idle";
+    setPhase("listening");
+    recognizing.current = true;
+    ExpoSpeechRecognitionModule.start({
+      lang: lang === "learner" ? LEARNER_LANG : TARGET_LANG,
+      interimResults: true,
+      continuous: true,
+      addsPunctuation: true,
+      requiresOnDeviceRecognition: false,
+      iosCategory: { category: "playAndRecord", categoryOptions: ["defaultToSpeaker", "allowBluetooth"], mode: "default" },
+      volumeChangeEventOptions: { enabled: true, intervalMillis: 150 },
+    });
+
+    stopSilenceTimer();
+    silenceTimer.current = setInterval(() => {
+      const now = Date.now();
+      const quiet = now - lastLoudAt.current > QUIET_MS;
+      if (transcript.current.trim() && lastResultAt.current && now - lastResultAt.current > SILENCE_TO_SEND_MS && quiet) {
+        endAction.current = "send";
+        stopSilenceTimer();
+        ExpoSpeechRecognitionModule.stop();
+      } else if (!transcript.current.trim() && now - listenStartedAt.current > NO_SPEECH_MS) {
+        endAction.current = "idle";
+        stopSilenceTimer();
+        ExpoSpeechRecognitionModule.stop();
+      }
+    }, 250);
+  }
+
+  /** "How do I say…?": escucha en inglés, propone la frase en español (sin mostrar el inglés) y te deja repetirla. */
+  function startHowToSay() {
+    abortRecognition();
+    stopSilenceTimer();
+    setHelper(null);
+    setTimeout(() => alive.current && startListening("learner"), 200);
+  }
+
+  async function howToSay(said: string) {
+    neededHelp.current = true;
+    setHelperBusy(true);
+    setPhase("waiting");
+    try {
+      const context = [...messagesRef.current].reverse().find((m) => m.role === "assistant")?.content ?? "";
+      const es = await callClaude({
+        model: MODEL_CONVERSATION,
+        systemStatic:
+          "A beginner learner of Spanish doesn't know how to say something. They give you the sentence in English. Return only how a Mexican speaker would say it, naturally and simply, with frequent words and short sentences. No quotes, no explanations, no English.",
+        messages: [{ role: "user", content: `Context, the last thing they were told: ${context}\n\nWhat they want to say: ${said}` }],
+        maxTokens: 200,
+      });
+      if (!alive.current) return;
+      setHelper({ es });
+      speakHelper(es);
+    } catch (e: any) {
+      setError(e?.message ?? "Couldn't prepare the sentence.");
+    }
+    setHelperBusy(false);
+  }
+
+  function speakHelper(es: string) {
+    abortRecognition();
+    stopSilenceTimer();
+    setPhase("speaking");
+    ttsSpeak(es, {
+      googleVoice: character.googleVoice,
+      deviceVoice: voiceId.current,
+      rate: character.speechRate * 0.85,
+      onDone: () => {
+        if (alive.current) setTimeout(() => alive.current && startListening("target"), 80);
+      },
+    });
+  }
+
+  /** Terminar tu turno a mano (si no quieres esperar la pausa). */
+  function finishTurnNow() {
+    endAction.current = "send";
+    stopSilenceTimer();
+    ExpoSpeechRecognitionModule.stop();
+  }
+
+  function askAyuda() {
+    if (phase === "listening") {
+      endAction.current = "ayuda";
+      stopSilenceTimer();
+      ExpoSpeechRecognitionModule.stop();
+    } else {
+      sendText("ayuda", false);
+    }
+  }
+
+  async function sendText(text: string, fromVoice: boolean) {
+    let content = text;
+    if (neededHelp.current) {
+      content = `${content}\n\n${NOTE_SIMPLER}`;
+      neededHelp.current = false;
+    }
+    const minutes = (Date.now() - startedAt.current) / 60000;
+    if (minutes >= WRAP_UP_MINUTES) content = `${content}\n\n[QUEDA POCO]`;
+    const history = [...messagesRef.current, { role: "user" as const, content }];
+    messagesRef.current = history;
+    setMessages(history);
+    setDraft("");
+    setHelper(null);
+    void fromVoice;
+    await characterTurn(history);
+  }
+
+  /** Tocar una palabra: explicación en español sencillo, emoji y gesto. Nunca traducción. */
+  async function openWord(raw: string, sentence: string) {
+    const word = cleanWord(raw);
+    if (!word) return;
+    neededHelp.current = true;
+    resumeAfterLookup.current = phase === "listening" || phase === "speaking";
+    abortRecognition();
+    stopSilenceTimer();
+    stopSpeaking();
+    setPhase("waiting");
+    setLookup({ word, sentence });
+    try {
+      const data = await explainWord(word, sentence);
+      setLookup((l) => (l && l.word === word ? { ...l, data } : l));
+    } catch {
+      setLookup((l) => (l && l.word === word ? { ...l, error: "Ahorita no puedo explicarla." } : l));
+    }
+  }
+
+  function closeWord() {
+    setLookup(null);
+    if (resumeAfterLookup.current) startListening();
+  }
+
+  function sayExplanation(d: WordExplanation) {
+    ttsSpeak(`${d.lemma}. ${d.explicacion}. ${d.ejemplo}`, {
+      googleVoice: character.googleVoice,
+      deviceVoice: voiceId.current,
+      rate: 0.85,
+    });
+  }
+
+  function finish() {
+    alive.current = false;
+    stopSilenceTimer();
+    stopSpeaking();
+    abortRecognition();
+    if (!messagesRef.current.some((m) => m.role === "user")) {
+      onCancel();
+      return;
+    }
+    onFinish({
+      sessionId: sessionId.current,
+      characterId,
+      tappaId,
+      messages: messagesRef.current,
+      userSeconds: stats.current.seconds,
+      userSyllables: stats.current.syllables,
+      userWords: stats.current.words,
+    });
+  }
+
+  const clean = (s: string) => s.replace(/\n\n\[(QUEDA POCO|Nota de la app:[^\]]*)\]/g, "").replace(/\n\n\[QUEDA POCO\]/g, "");
+  /** Palabras de la respuesta del personaje que forman parte de la reformulación de lo que dijiste. */
+  function isRecastWord(index: number, w: string): boolean {
+    const better = analyses[index]?.correccion?.mejor;
+    if (!better) return false;
+    const target = cleanWord(w).toLowerCase();
+    if (target.length < 3) return false;
+    return better
+      .toLowerCase()
+      .split(/\s+/)
+      .map((x) => cleanWord(x))
+      .includes(target);
+  }
+
+  const mm = String(Math.floor(elapsed / 60)).padStart(2, "0");
+  const ss = String(elapsed % 60).padStart(2, "0");
+  const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+
+  return (
+    <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+      <View style={styles.header}>
+        <Pressable onPress={finish} hitSlop={12}>
+          <Text style={styles.headerAction}>Finish</Text>
+        </Pressable>
+        <Text style={styles.headerTitle}>{character.name}</Text>
+        <Text style={styles.timer}>
+          {mm}:{ss}
+        </Text>
+      </View>
+      {tappa && (
+        <View style={styles.mission}>
+          <Text style={styles.missionText}>
+            {tappa.emoji} {tappa.mission}
+          </Text>
+        </View>
+      )}
+
+      <ScrollView ref={scrollRef} style={{ flex: 1 }} contentContainerStyle={styles.chat} onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}>
+        {messages.map((m, i) =>
+          m.role === "user" ? (
+            <View key={i} style={styles.userBlock}>
+              <View style={[styles.bubble, styles.userBubble]}>
+                <Text style={[styles.bubbleText, { color: "#fff" }]}>{clean(m.content)}</Text>
+              </View>
+              {analyses[i + 1]?.correccion && (
+                <Text style={styles.recast}>
+                  <Text style={styles.recastSaid}>{analyses[i + 1]!.correccion!.dijo}</Text>
+                  {"  →  "}
+                  <Text style={styles.recastBetter}>{analyses[i + 1]!.correccion!.mejor}</Text>
+                </Text>
+              )}
+            </View>
+          ) : (
+            <View key={i} style={[styles.bubble, styles.charBubble, { borderLeftColor: character.color }]}>
+              <Text style={styles.bubbleText}>
+                {m.content.split(/(\s+)/).map((w, j) =>
+                  /\s+/.test(w) ? (
+                    w
+                  ) : (
+                    <Text
+                      key={j}
+                      onPress={() => openWord(w, m.content)}
+                      style={[
+                        lookup && cleanWord(w) === lookup.word ? styles.wordOn : undefined,
+                        isRecastWord(i, w) ? styles.recastWord : undefined,
+                      ]}
+                    >
+                      {w}
+                    </Text>
+                  )
+                )}
+              </Text>
+              {analyses[i]?.visual?.length ? (
+                <View style={styles.visuals}>
+                  {analyses[i].visual.map((v, k) => (
+                    <Pressable key={k} style={styles.visual} onPress={() => openWord(v.palabra, m.content)}>
+                      {v.image ? <Image source={{ uri: v.image }} style={styles.visualImg} /> : <Text style={styles.visualEmoji}>{v.emoji}</Text>}
+                      <Text style={styles.visualWord}>{v.lemma}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              ) : null}
+              <View style={styles.tools}>
+                <Pressable onPress={() => speak(m.content, 1, true)} hitSlop={8}>
+                  <Text style={styles.tool}>↻ Repeat</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => {
+                    neededHelp.current = true;
+                    speak(m.content, 0.7, true);
+                  }}
+                  hitSlop={8}
+                >
+                  <Text style={styles.tool}>🐢 Slower</Text>
+                </Pressable>
+                <Text style={styles.toolHint}>Tap a word</Text>
+              </View>
+            </View>
+          )
+        )}
+        {phase === "thinking" && <ActivityIndicator color={character.color} style={{ marginTop: 8 }} />}
+        {error && <Text style={styles.error}>{error}</Text>}
+      </ScrollView>
+
+      <View style={styles.bottom}>
+        {phase === "typing" ? (
+          <>
+            <TextInput style={styles.input} value={draft} onChangeText={setDraft} multiline autoCorrect={false} placeholder="Write in Spanish…" />
+            <View style={styles.row}>
+              <Pressable style={styles.ghost} onPress={() => startListening()}>
+                <Text style={styles.ghostText}>Speak</Text>
+              </Pressable>
+              <Pressable style={[styles.primary, !draft.trim() && { opacity: 0.4 }]} disabled={!draft.trim()} onPress={() => sendText(draft.trim(), false)}>
+                <Text style={styles.primaryText}>Send</Text>
+              </Pressable>
+            </View>
+          </>
+        ) : (
+          <>
+            {lookup && (
+              <View style={styles.wordCard}>
+                <View style={styles.wordHead}>
+                  <Text style={styles.wordTitle}>
+                    {lookup.data?.emoji ? `${lookup.data.emoji}  ` : ""}
+                    {lookup.data?.lemma || lookup.word}
+                  </Text>
+                  <Pressable onPress={closeWord} hitSlop={12}>
+                    <Text style={styles.wordClose}>✕</Text>
+                  </Pressable>
+                </View>
+                {!lookup.data && !lookup.error && <ActivityIndicator color={character.color} />}
+                {lookup.error && <Text style={styles.wordText}>{lookup.error}</Text>}
+                {lookup.data && (
+                  <>
+                    {lookup.data.image ? <Image source={{ uri: lookup.data.image }} style={styles.wordImg} /> : null}
+                    <Text style={styles.wordText}>{lookup.data.explicacion}</Text>
+                    {lookup.data.ejemplo ? <Text style={styles.wordExample}>«{lookup.data.ejemplo}»</Text> : null}
+                    {lookup.data.contrario ? <Text style={styles.wordMeta}>↔ {lookup.data.contrario}</Text> : null}
+                    {lookup.data.gesto ? <Text style={styles.wordMeta}>🙌 {lookup.data.gesto}</Text> : null}
+                    <Pressable onPress={() => sayExplanation(lookup.data!)} hitSlop={8}>
+                      <Text style={styles.tool}>🔊 Escuchar</Text>
+                    </Pressable>
+                  </>
+                )}
+              </View>
+            )}
+            {helper && (
+              <View style={styles.helper}>
+                <Text style={styles.helperEs}>Se dice así:</Text>
+                <Text style={styles.helperIt}>{helper.es}</Text>
+                <View style={styles.tools}>
+                  <Pressable onPress={() => speakHelper(helper.es)} hitSlop={8}>
+                    <Text style={styles.tool}>↻ Hear it again</Text>
+                  </Pressable>
+                  <Text style={styles.helperHint}>Now you say it</Text>
+                </View>
+              </View>
+            )}
+            <Text style={styles.status}>
+              {phase === "thinking" && `${character.name} is thinking…`}
+              {phase === "speaking" && `${character.name} is talking`}
+              {phase === "listening" && (draft || (listenLang.current === "learner" ? "Say it in English…" : "I'm listening… speak whenever you're ready"))}
+              {phase === "waiting" && helperBusy && "Getting the Spanish ready…"}
+              {phase === "waiting" && !helperBusy && "Tap the microphone when you want to answer"}
+            </Text>
+            <View style={styles.row}>
+              <Pressable style={styles.ghost} disabled={phase === "thinking" || helperBusy} onPress={startHowToSay}>
+                <Text style={styles.ghostText}>How do I say…?</Text>
+              </Pressable>
+              {phase === "listening" ? (
+                <Pressable style={[styles.mic, styles.micOn]} onPress={finishTurnNow}>
+                  <Text style={styles.micText}>I’m done</Text>
+                </Pressable>
+              ) : phase === "speaking" ? (
+                <Pressable style={styles.mic} onPress={() => startListening()}>
+                  <Text style={styles.micText}>Answer now</Text>
+                </Pressable>
+              ) : (
+                <Pressable style={[styles.mic, phase === "thinking" && { opacity: 0.4 }]} disabled={phase === "thinking"} onPress={() => startListening()}>
+                  <Text style={styles.micText}>🎙 Speak</Text>
+                </Pressable>
+              )}
+            </View>
+            {(phase === "waiting" || phase === "listening") && lastAssistant && (
+              <View style={styles.links}>
+                <Pressable onPress={askAyuda} hitSlop={8}>
+                  <Text style={styles.link}>Ayuda: make it easier</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => {
+                    abortRecognition();
+                    stopSilenceTimer();
+                    setPhase("typing");
+                  }}
+                  hitSlop={8}
+                >
+                  <Text style={styles.link}>Type instead</Text>
+                </Pressable>
+              </View>
+            )}
+          </>
+        )}
+      </View>
+    </KeyboardAvoidingView>
+  );
+}
+
+const styles = StyleSheet.create({
+  screen: { flex: 1, backgroundColor: colors.bg },
+  header: { paddingTop: 60, paddingHorizontal: gap, paddingBottom: 12, flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderBottomWidth: 1, borderBottomColor: colors.line },
+  headerAction: { color: colors.accent, fontWeight: "600", fontSize: 16 },
+  mission: { backgroundColor: colors.accentSoft, paddingHorizontal: gap, paddingVertical: 10 },
+  missionText: { fontSize: 14, lineHeight: 19, color: colors.ink },
+  headerTitle: { fontSize: 18, fontWeight: "700", color: colors.ink },
+  timer: { fontVariant: ["tabular-nums"], color: colors.muted, fontSize: 16 },
+  chat: { padding: gap, gap: 10 },
+  bubble: { padding: 14, borderRadius: radius, maxWidth: "88%" },
+  charBubble: { backgroundColor: colors.card, alignSelf: "flex-start", borderLeftWidth: 4 },
+  userBubble: { backgroundColor: colors.accent, alignSelf: "flex-end" },
+  bubbleText: { fontSize: 17, lineHeight: 24, color: colors.ink },
+  toolHint: { color: colors.muted, fontSize: 13 },
+  userBlock: { alignSelf: "flex-end", alignItems: "flex-end", maxWidth: "88%", gap: 4 },
+  recast: { fontSize: 14, color: colors.muted, textAlign: "right" },
+  recastSaid: { textDecorationLine: "line-through", color: colors.muted },
+  recastBetter: { color: colors.ok, fontWeight: "700" },
+  recastWord: { color: colors.ok, fontWeight: "700", textDecorationLine: "underline" },
+  visuals: { flexDirection: "row", gap: 8, marginTop: 10, flexWrap: "wrap" },
+  visual: { width: 84, alignItems: "center", gap: 4 },
+  visualImg: { width: 84, height: 84, borderRadius: 12, backgroundColor: colors.line },
+  visualEmoji: { fontSize: 44, lineHeight: 84, height: 84, textAlign: "center" },
+  visualWord: { fontSize: 13, color: colors.ink, fontWeight: "600" },
+  wordOn: { backgroundColor: colors.accentSoft },
+  wordCard: { backgroundColor: colors.card, borderRadius: radius, padding: 14, gap: 6, borderWidth: 1, borderColor: colors.accent },
+  wordHead: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  wordTitle: { fontSize: 22, fontWeight: "700", color: colors.ink },
+  wordClose: { fontSize: 18, color: colors.muted },
+  wordImg: { width: "100%", height: 140, borderRadius: 12, backgroundColor: colors.line },
+  wordText: { fontSize: 17, lineHeight: 24, color: colors.ink },
+  wordExample: { fontSize: 15, color: colors.muted, fontStyle: "italic" },
+  wordMeta: { fontSize: 15, color: colors.ink },
+  tools: { flexDirection: "row", gap: 16, marginTop: 10 },
+  tool: { color: colors.accent, fontSize: 13, fontWeight: "600" },
+  error: { color: colors.danger, marginTop: 8 },
+  bottom: { padding: gap, paddingBottom: 36, gap: 10, borderTopWidth: 1, borderTopColor: colors.line, backgroundColor: colors.bg },
+  status: { fontSize: 16, color: colors.ink, minHeight: 24 },
+  input: { backgroundColor: colors.card, borderRadius: radius, borderWidth: 1, borderColor: colors.line, padding: 12, fontSize: 17, minHeight: 60 },
+  row: { flexDirection: "row", gap: 10 },
+  primary: { flex: 2, backgroundColor: colors.accent, borderRadius: radius, padding: 16, alignItems: "center" },
+  primaryText: { color: "#fff", fontWeight: "700", fontSize: 16 },
+  ghost: { flex: 1, borderRadius: radius, borderWidth: 1, borderColor: colors.accent, padding: 16, alignItems: "center" },
+  ghostText: { color: colors.accent, fontWeight: "600", fontSize: 16 },
+  mic: { flex: 2, backgroundColor: colors.accent, borderRadius: radius, padding: 18, alignItems: "center" },
+  micOn: { backgroundColor: colors.danger },
+  micText: { color: "#fff", fontWeight: "700", fontSize: 18 },
+  link: { color: colors.muted, textAlign: "center", fontSize: 14 },
+  links: { flexDirection: "row", justifyContent: "space-around" },
+  helper: { backgroundColor: colors.accentSoft, borderRadius: radius, padding: 14, gap: 4 },
+  helperEs: { fontSize: 13, color: colors.muted },
+  helperIt: { fontSize: 19, fontWeight: "700", color: colors.ink, lineHeight: 26 },
+  helperHint: { fontSize: 13, color: colors.muted },
+});

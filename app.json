@@ -2,6 +2,7 @@
   "expo": {
     "name": "Thrivlingo",
     "slug": "thrivlingo",
+    "owner": "harmat",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -10,6 +11,11 @@
       "supportsTablet": false,
       "bundleIdentifier": "es.harmat.thrivlingo",
       "infoPlist": {
+        "NSMicrophoneUsageDescription": "Thrivlingo uses the microphone so you can talk with the characters in Spanish.",
+        "NSSpeechRecognitionUsageDescription": "Thrivlingo turns your voice into text to understand you and measure your fluency.",
+        "UIBackgroundModes": [
+          "audio"
+        ],
         "ITSAppUsesNonExemptEncryption": false
       }
     },
@@ -20,11 +26,29 @@
       [
         "expo-speech-recognition",
         {
-          "microphonePermission": "Thrivlingo uses the microphone so you can talk with the characters.",
-          "speechRecognitionPermission": "Thrivlingo turns your voice into text so the characters can understand you."
+          "microphonePermission": "Thrivlingo uses the microphone so you can talk with the characters in Spanish.",
+          "speechRecognitionPermission": "Thrivlingo turns your voice into text to understand you and measure your fluency."
+        }
+      ],
+      "expo-sqlite",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#F7F6F1"
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Thrivlingo uses the microphone so you can talk with the characters in Spanish."
         }
       ]
     ],
-    "owner": "harmat"
+    "runtimeVersion": {
+      "policy": "fingerprint"
+    }
   }
 }

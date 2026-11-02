@@ -1,47 +1,89 @@
-// Talks to the Thrivlingo intermediary (worker/), which holds the AI key.
-import { Conversation } from './data/profiles';
+import { API_URL, APP_KEY } from "./config";
+import { learner } from "./learners";
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL ?? '';
-const APP_TOKEN = process.env.EXPO_PUBLIC_APP_TOKEN ?? '';
+export type ChatMessage = { role: "user" | "assistant"; content: string };
 
-export type Turn = { role: 'character' | 'learner'; text: string };
+type SystemBlock = { type: "text"; text: string; cache_control?: { type: "ephemeral" } };
 
-export type ChatReply = {
-  reply: string;
-  translation: string;
-  suggestion?: { es: string; en: string };
-  done?: boolean;
-};
-
-export type Review = {
-  corrections: { said: string; better: string; why: string }[];
-  wellDone: string;
-};
-
-async function post<T>(path: string, email: string, conversation: Conversation, turns: Turn[]) {
-  if (!API_URL) throw new Error('The app is missing its server address (EXPO_PUBLIC_API_URL).');
-  const res = await fetch(`${API_URL}${path}`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-app-token': APP_TOKEN,
-      'x-learner-email': email,
-    },
-    body: JSON.stringify({
-      scenario: {
-        situation: conversation.situation,
-        character: conversation.character,
-        goal: conversation.goal,
-      },
-      turns,
-    }),
-  });
-  if (!res.ok) throw new Error(`Server error (${res.status}). Please try again.`);
-  return (await res.json()) as T;
+class ApiError extends Error {
+  constructor(public status: number, public detail: string) {
+    super(`Error ${status} talking to the AI. ${detail.slice(0, 200)}`);
+  }
 }
 
-export const nextLine = (email: string, c: Conversation, turns: Turn[]) =>
-  post<ChatReply>('/chat', email, c, turns);
+/** Clave de la app y email de quien la usa: el intermediario solo deja pasar emails de su lista. */
+export function authHeaders(): Record<string, string> {
+  return { "x-thrivlingo-key": APP_KEY, "x-learner-email": learner().email };
+}
 
-export const getReview = (email: string, c: Conversation, turns: Turn[]) =>
-  post<Review>('/review', email, c, turns);
+async function request(body: object): Promise<any> {
+  const res = await fetch(`${API_URL}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new ApiError(res.status, text);
+  }
+  return res.json();
+}
+
+/**
+ * Cómo se apaga el razonamiento interno ("thinking") en cada modelo. Los modelos actuales lo
+ * activan por defecto y se comía el límite de respuesta, dejando respuestas vacías.
+ * Cada modelo lo pide de una forma distinta (comprobado el 30/10/2026):
+ * Haiku 5.5 acepta "disabled"; Sonnet 5.5 rechaza "disabled" y pide "between_tools".
+ */
+const THINKING_OFF: Record<string, object> = {
+  "claude-haiku-5-5": { type: "disabled" },
+  "claude-sonnet-5-5": { type: "between_tools" },
+};
+
+/**
+ * Llama a Claude con el razonamiento apagado. Si el modelo rechaza la forma de apagarlo,
+ * reintenta sin indicarlo y con más margen de respuesta. Si llega vacía, reintenta una vez.
+ */
+export async function callClaude(opts: {
+  model: string;
+  systemStatic: string;
+  systemDynamic?: string;
+  messages: ChatMessage[];
+  maxTokens: number;
+}): Promise<string> {
+  const system: SystemBlock[] = [{ type: "text", text: opts.systemStatic, cache_control: { type: "ephemeral" } }];
+  if (opts.systemDynamic) system.push({ type: "text", text: opts.systemDynamic });
+
+  const thinking = THINKING_OFF[opts.model];
+  const base: Record<string, unknown> = { model: opts.model, system, messages: opts.messages };
+  if (thinking) base.thinking = thinking;
+  for (const maxTokens of [opts.maxTokens, Math.min(opts.maxTokens * 3, 2000)]) {
+    let data: any;
+    try {
+      data = await request({ ...base, max_tokens: maxTokens });
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 400 && /thinking/i.test(e.detail) && base.thinking) {
+        delete base.thinking; // el modelo no acepta esa forma: se deja su valor por defecto
+        data = await request({ ...base, max_tokens: Math.min(Math.max(maxTokens * 3, 1500), 2000) });
+      } else {
+        throw e;
+      }
+    }
+    const text = (data.content || [])
+      .filter((b: any) => b.type === "text")
+      .map((b: any) => b.text)
+      .join("")
+      .trim();
+    if (text) return text;
+  }
+  throw new Error("The AI did not answer. Please try again.");
+}
+
+/** Extrae el primer objeto JSON de una respuesta, por si el modelo añade texto o marcas alrededor. */
+export function parseJson<T>(text: string): T {
+  const cleaned = text.replace(/```json|```/g, "");
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start === -1 || end === -1) throw new Error("The answer did not come in the expected format. Tap Try again.");
+  return JSON.parse(cleaned.slice(start, end + 1)) as T;
+}

@@ -1,153 +1,120 @@
-// Thrivlingo intermediary. Keeps the Anthropic key off the phone.
-// Two jobs:
-//   POST /chat   -> the character's next line (fast, cheap model)
-//   POST /review -> up to three corrections at the end (stronger model)
+/**
+ * Intermediario de Thrivlingo en Cloudflare Workers (basado en el de Tavola).
+ *
+ * - POST /v1/messages: pasa la petición a Claude con la clave guardada (ANTHROPIC_API_KEY).
+ * - GET  /v1/tts?text=...&voice=...&rate=...: devuelve el audio MP3 de la voz de Google
+ *   (Chirp 3 HD, español de EE. UU.) usando GOOGLE_TTS_KEY. Cada frase se guarda en caché,
+ *   así repetirla no gasta caracteres de Google.
+ * Solo acepta peticiones con la clave propia de la app (THRIVLINGO_APP_KEY) y de un email
+ * de la lista ALLOWED_EMAILS.
+ */
 
 export interface Env {
-  ANTHROPIC_API_KEY: string; // secret: wrangler secret put ANTHROPIC_API_KEY
-  APP_TOKEN: string; // secret: same value as EXPO_PUBLIC_APP_TOKEN in the app
-  ALLOWED_EMAILS: string; // comma-separated, set in wrangler.toml
+  ANTHROPIC_API_KEY: string;
+  THRIVLINGO_APP_KEY: string;
+  GOOGLE_TTS_KEY?: string;
+  ALLOWED_EMAILS: string;
 }
 
-const CHAT_MODEL = 'claude-haiku-5-5';
-const REVIEW_MODEL = 'claude-sonnet-5-5';
-
-type Turn = { role: 'character' | 'learner'; text: string };
-type Scenario = {
-  situation: string;
-  character: { name: string; role: string };
-  goal: string;
-};
+const ALLOWED_MODELS = new Set(["claude-haiku-5-5", "claude-sonnet-5-5"]);
+const MAX_TOKENS_LIMIT = 2000;
+const VOICE_RE = /^es-US-Chirp3-HD-[A-Za-z]+$/;
+const MAX_TTS_CHARS = 600;
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method !== 'POST') return json({ error: 'not found' }, 404);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
 
-    if (request.headers.get('x-app-token') !== env.APP_TOKEN) {
-      return json({ error: 'unauthorized' }, 401);
+    if (request.method === "GET" && url.pathname === "/health") {
+      return json({ ok: true, tts: Boolean(env.GOOGLE_TTS_KEY) });
     }
-    const email = (request.headers.get('x-learner-email') ?? '').trim().toLowerCase();
-    const allowed = env.ALLOWED_EMAILS.split(',').map((e) => e.trim().toLowerCase());
-    if (!allowed.includes(email)) return json({ error: 'unknown learner' }, 403);
 
-    const body = (await request.json()) as { scenario: Scenario; turns: Turn[] };
-    const path = new URL(request.url).pathname;
+    if (!env.THRIVLINGO_APP_KEY || request.headers.get("x-thrivlingo-key") !== env.THRIVLINGO_APP_KEY) {
+      return json({ error: "unauthorized" }, 401);
+    }
+    const email = (request.headers.get("x-learner-email") || "").trim().toLowerCase();
+    const allowed = (env.ALLOWED_EMAILS || "").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+    if (!allowed.includes(email)) {
+      return json({ error: "unknown_learner" }, 403);
+    }
 
+    if (request.method === "GET" && url.pathname === "/v1/tts") {
+      return tts(url, env, ctx);
+    }
+
+    if (request.method !== "POST" || url.pathname !== "/v1/messages") {
+      return json({ error: "not_found" }, 404);
+    }
+
+    let body: any;
     try {
-      if (path === '/chat') return json(await chat(env, body.scenario, body.turns));
-      if (path === '/review') return json(await review(env, body.scenario, body.turns));
-      return json({ error: 'not found' }, 404);
-    } catch (e) {
-      return json({ error: String(e) }, 502);
+      body = await request.json();
+    } catch {
+      return json({ error: "invalid_json" }, 400);
     }
+
+    if (!ALLOWED_MODELS.has(body?.model)) {
+      return json({ error: "model_not_allowed" }, 400);
+    }
+    body.max_tokens = Math.min(Number(body.max_tokens) || 400, MAX_TOKENS_LIMIT);
+    delete body.stream;
+
+    const upstream = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(body),
+    });
+
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: { "content-type": "application/json" },
+    });
   },
 };
 
-async function chat(env: Env, s: Scenario, turns: Turn[]) {
-  const system = `You are ${s.character.name}, a ${s.character.role}, in a short Spanish practice role-play.
-Situation (for context): ${s.situation}
-The learner's goal: ${s.goal}
+async function tts(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+  if (!env.GOOGLE_TTS_KEY) return json({ error: "tts_not_configured" }, 503);
+  const text = (url.searchParams.get("text") || "").trim();
+  const voice = url.searchParams.get("voice") || "es-US-Chirp3-HD-Kore";
+  const rate = Math.min(Math.max(Number(url.searchParams.get("rate")) || 1, 0.5), 1.5);
+  if (!text || text.length > MAX_TTS_CHARS) return json({ error: "bad_text" }, 400);
+  if (!VOICE_RE.test(voice)) return json({ error: "bad_voice" }, 400);
 
-The learner is an English-speaking adult who is a beginner in Spanish.
-Rules:
-- Speak natural Mexican Spanish, as a friendly real person would. Use "usted" unless the character is a friend.
-- Keep every reply to one or two short, simple sentences. Common words only.
-- Stay in character. Never correct the learner during the conversation; if you don't understand, ask again in simpler words, like a patient native speaker.
-- Help the learner reach the goal with your questions, but don't do it for them.
-- When the goal has clearly been reached, close the scene naturally and set "done" to true.
-- Also write a short suggestion of something the learner could say next, in Spanish with its English meaning.
+  // Caché por frase, voz y velocidad (ni la clave ni el email forman parte de la clave de caché)
+  const cacheKey = new Request(`https://tts-cache.thrivlingo/${encodeURIComponent(voice)}/${rate}/${encodeURIComponent(text)}`);
+  const cache = caches.default;
+  const hit = await cache.match(cacheKey);
+  if (hit) return hit;
 
-Answer ONLY with JSON, no other text:
-{"reply": "...", "translation": "English translation of reply", "suggestion": {"es": "...", "en": "..."}, "done": false}`;
-
-  const messages = toMessages(turns);
-  const text = await callClaude(env, CHAT_MODEL, system, messages, 400);
-  return parseJson(text);
-}
-
-async function review(env: Env, s: Scenario, turns: Turn[]) {
-  const transcript = turns
-    .map((t) => `${t.role === 'learner' ? 'LEARNER' : s.character.name.toUpperCase()}: ${t.text}`)
-    .join('\n');
-
-  const system = `You review a beginner's Spanish practice conversation (Mexican Spanish).
-The learner is an English speaker. Their words come from phone speech recognition, so ignore
-punctuation, capital letters, and anything that looks like a recognition glitch rather than a real mistake.
-
-Pick AT MOST three mistakes, the ones that matter most for being understood. Fewer is fine.
-For each one, give the smallest possible fix (change only what is wrong) and a one-sentence
-explanation in plain English, no grammar jargon. If something was correct, don't list it.
-Also name one thing the learner did well, in one short English sentence.
-
-Answer ONLY with JSON, no other text:
-{"corrections": [{"said": "...", "better": "...", "why": "..."}], "wellDone": "..."}`;
-
-  const text = await callClaude(
-    env,
-    REVIEW_MODEL,
-    system,
-    [{ role: 'user', content: `Scenario: ${s.situation}\nGoal: ${s.goal}\n\n${transcript}` }],
-    700,
-  );
-  return parseJson(text);
-}
-
-// The conversation is sent to the model with the learner as "user" and the character as "assistant".
-// The model API needs the first message to be from the user, so the character's opener is folded in.
-function toMessages(turns: Turn[]) {
-  const messages: { role: 'user' | 'assistant'; content: string }[] = [];
-  for (const t of turns) {
-    const role = t.role === 'learner' ? 'user' : 'assistant';
-    if (messages.length === 0 && role === 'assistant') {
-      messages.push({ role: 'user', content: '(The scene starts.)' });
-    }
-    const last = messages[messages.length - 1];
-    if (last && last.role === role) last.content += `\n${t.text}`;
-    else messages.push({ role, content: t.text });
-  }
-  return messages;
-}
-
-async function callClaude(
-  env: Env,
-  model: string,
-  system: string,
-  messages: { role: 'user' | 'assistant'; content: string }[],
-  maxTokens: number,
-): Promise<string> {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
+  const g = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${env.GOOGLE_TTS_KEY}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      model,
-      max_tokens: maxTokens,
-      // The instructions repeat on every turn, so they are cached to cut cost.
-      system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
-      messages,
+      input: { text },
+      voice: { languageCode: "es-US", name: voice },
+      audioConfig: { audioEncoding: "MP3", speakingRate: rate },
     }),
   });
-  if (!res.ok) throw new Error(`model error ${res.status}: ${await res.text()}`);
-  const data = (await res.json()) as { content: { type: string; text?: string }[] };
-  return data.content
-    .filter((c) => c.type === 'text')
-    .map((c) => c.text)
-    .join('');
+  if (!g.ok) {
+    const detail = await g.text().catch(() => "");
+    return json({ error: "google_error", status: g.status, detail: detail.slice(0, 300) }, 502);
+  }
+  const data: any = await g.json();
+  const bytes = Uint8Array.from(atob(data.audioContent || ""), (c) => c.charCodeAt(0));
+  const res = new Response(bytes, {
+    headers: { "content-type": "audio/mpeg", "cache-control": "public, max-age=31536000" },
+  });
+  ctx.waitUntil(cache.put(cacheKey, res.clone()));
+  return res;
 }
 
-function parseJson(text: string) {
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start === -1 || end === -1) throw new Error('model did not return JSON');
-  return JSON.parse(text.slice(start, end + 1));
-}
-
-function json(data: unknown, status = 200) {
+function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'content-type': 'application/json' },
+    headers: { "content-type": "application/json" },
   });
 }

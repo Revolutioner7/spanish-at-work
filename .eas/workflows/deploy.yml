@@ -1,0 +1,49 @@
+# Cada vez que se sube código a GitHub (rama main):
+# - si el cambio solo toca la app por dentro (pantallas, textos, personajes, recorridos),
+#   se envía al iPhone como actualización por el aire, sin reinstalar;
+# - si el cambio necesita una app nueva (módulos nativos, permisos), se compila
+#   y se envía a TestFlight.
+# Lección de Tavola: la actualización se publica en el CANAL (no en una rama), así siempre
+# llega a la app instalada desde TestFlight.
+name: Deploy Thrivlingo
+
+on:
+  push:
+    branches: ['main']
+
+jobs:
+  fingerprint:
+    name: App fingerprint
+    type: fingerprint
+    environment: production
+  get_ios_build:
+    name: Is there a compatible app already?
+    needs: [fingerprint]
+    type: get-build
+    params:
+      platform: ios
+      profile: production
+      fingerprint_hash: ${{ needs.fingerprint.outputs.ios_fingerprint_hash }}
+  build_ios:
+    name: Build a new app
+    needs: [get_ios_build]
+    if: ${{ !needs.get_ios_build.outputs.build_id }}
+    type: build
+    params:
+      platform: ios
+      profile: production
+  submit_ios:
+    name: Send to TestFlight
+    needs: [build_ios]
+    type: submit
+    params:
+      build_id: ${{ needs.build_ios.outputs.build_id }}
+      profile: production
+  publish_ios_update:
+    name: Send over-the-air update
+    needs: [get_ios_build]
+    if: ${{ needs.get_ios_build.outputs.build_id }}
+    type: update
+    params:
+      channel: production
+      platform: ios

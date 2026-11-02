@@ -3,11 +3,15 @@
   "version": "1.0.0",
   "main": "index.ts",
   "dependencies": {
-    "@react-native-async-storage/async-storage": "2.2.0",
     "expo": "~58.0.20",
+    "expo-audio": "~58.0.10",
+    "expo-constants": "~58.0.13",
     "expo-speech": "~58.0.3",
     "expo-speech-recognition": "^58.0.0",
+    "expo-splash-screen": "~58.0.11",
+    "expo-sqlite": "~58.0.14",
     "expo-status-bar": "~58.0.4",
+    "expo-updates": "~58.0.18",
     "react": "19.3.0",
     "react-native": "0.88.0"
   },
